@@ -117,12 +117,25 @@ fn main() {
         };
 
         // Ask the strategy for the best move
-        let (out_y, out_x) = match game.choose_best_move(&board, &piece) {
-            Some((y, x)) => (y, x),
-            None => (0usize, 0usize), // fallback if no valid placement
+        // choose_best_move returns (row, col) but we need to output "X Y" format
+        // where X is column and Y is row
+        let (out_row, out_col) = match game.choose_best_move(&board, &piece) {
+            Some((y, x)) => {
+                eprintln!("[DEBUG] Found placement at row={}, col={}", y, x);
+                (y, x)
+            }
+            None => {
+                eprintln!("[DEBUG] No valid placement found! Board: {}x{}, Piece: {}x{}", 
+                    board.rows, board.cols, piece.height, piece.width);
+                eprintln!("[DEBUG] Piece cells: {} filled", piece.cells.len());
+                eprintln!("[DEBUG] My territory cells: {}", 
+                    board.cells.iter().flatten().filter(|&&c| c == crate::board::Owner::Me).count());
+                (0usize, 0usize) // fallback if no valid placement
+            }
         };
 
-        println!("{} {}", out_y, out_x);
+        // Output in "X Y" format where X=column, Y=row
+        println!("{} {}", out_col, out_row);
         let _ = io::stdout().flush();
     }
 }

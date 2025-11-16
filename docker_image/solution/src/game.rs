@@ -2,7 +2,6 @@
 
 use crate::board::{Board, Owner};
 use crate::piece::Piece;
-use std::collections::VecDeque;
 
 pub struct Game {
     pub my_player: u8,
@@ -17,34 +16,62 @@ impl Game {
     /// Returns (row, col) in board coordinates (y, x).
     pub fn choose_best_move(&self, board: &Board, piece: &Piece) -> Option<(usize, usize)> {
         if piece.cells.is_empty() || board.rows == 0 || board.cols == 0 {
+            eprintln!("[DEBUG] Board or piece empty");
             return None;
         }
 
         if piece.height > board.rows || piece.width > board.cols {
+            eprintln!("[DEBUG] Piece too large: {}x{} vs board {}x{}", 
+                piece.height, piece.width, board.rows, board.cols);
             return None;
         }
 
-        let mut best_pos: Option<(usize, usize)> = None;
-        let mut best_score: i64 = i64::MAX;
+        // Precompute coordinates
+        let mut enemy_coords: Vec<(usize, usize)> = Vec::new();
+        let mut my_coords: Vec<(usize, usize)> = Vec::new();
+        for y in 0..board.rows {
+            for x in 0..board.cols {
+                match board.cells[y][x] {
+                    Owner::Opponent => enemy_coords.push((y, x)),
+                    Owner::Me => my_coords.push((y, x)),
+                    _ => {}
+                }
+            }
+        }
 
-        for top_y in 0..=board.rows - piece.height {
-            for left_x in 0..=board.cols - piece.width {
+        // For large boards, limit search space to area around our territory
+        let (search_min_y, search_max_y, search_min_x, search_max_x) = if my_coords.is_empty() {
+            (0, board.rows, 0, board.cols)
+        } else if board.rows * board.cols > 2000 {
+            // Large board optimization: search only near our territory
+            let margin = 15.max(piece.height * 2).max(piece.width * 2);
+            let min_y = my_coords.iter().map(|(y, _)| *y).min().unwrap().saturating_sub(margin);
+            let max_y = (my_coords.iter().map(|(y, _)| *y).max().unwrap() + margin + piece.height).min(board.rows);
+            let min_x = my_coords.iter().map(|(_, x)| *x).min().unwrap().saturating_sub(margin);
+            let max_x = (my_coords.iter().map(|(_, x)| *x).max().unwrap() + margin + piece.width).min(board.cols);
+            (min_y, max_y, min_x, max_x)
+        } else {
+            (0, board.rows, 0, board.cols)
+        };
+
+        let mut best_pos: Option<(usize, usize)> = None;
+        let mut best_score: i64 = i64::MIN;
+
+        // Optimized search within bounded area
+        let max_y = search_max_y.saturating_sub(piece.height).saturating_add(1);
+        let max_x = search_max_x.saturating_sub(piece.width).saturating_add(1);
+        
+        for top_y in search_min_y..max_y {
+            for left_x in search_min_x..max_x {
                 if !self.is_valid_placement(board, piece, top_y, left_x) {
                     continue;
                 }
 
-                let score = self.score_placement(board, piece, top_y, left_x);
+                let score = self.evaluate_placement(board, piece, top_y, left_x, &enemy_coords);
 
-                if score < best_score {
+                if score > best_score {
                     best_score = score;
                     best_pos = Some((top_y, left_x));
-                } else if score == best_score {
-                    // Tie-breaker: smallest row, then smallest col (deterministic).
-                    if let Some((by, bx)) = best_pos {
-                        if top_y < by || (top_y == by && left_x < bx) {
-                            best_pos = Some((top_y, left_x));
-                        }
-                    }
                 }
             }
         }
@@ -91,218 +118,134 @@ impl Game {
         overlap_count == 1
     }
 
-    /// Core heuristic focused on:
-    /// - minimizing enemy's future space ("reachable empty area")
-    /// - maximizing our future space
-    /// - maximizing immediate gain (new cells we take now)
+    /// Simplified aggressive heuristic:
+    /// Priority: Expand territory, move toward enemy, block opponent, maintain mobility
     ///
-    /// LOWER score is better.
-    fn score_placement(
+    /// HIGHER score is better.
+    fn evaluate_placement(
         &self,
         board: &Board,
         piece: &Piece,
         top_y: usize,
         left_x: usize,
+        enemy_coords: &[(usize, usize)],
     ) -> i64 {
-        // 1) Count how many new cells we gain right now.
-        let mut new_cells: u64 = 0;
+        let rows = board.rows;
+        let cols = board.cols;
+
+        let mut new_territory: i64 = 0;
+        let mut enemy_adjacency: i64 = 0;
+        let mut future_liberties: i64 = 0;
+        let mut blocked_opponent: i64 = 0;
+
+        const DIRS: &[(isize, isize)] = &[(1, 0), (-1, 0), (0, 1), (0, -1)];
+
         for &(dy, dx) in &piece.cells {
-            let y = top_y + dy;
-            let x = left_x + dx;
-            if board.cells[y][x] == Owner::Empty {
-                new_cells += 1;
+            let ay = top_y + dy;
+            let ax = left_x + dx;
+
+            // Count new territory
+            if board.cells[ay][ax] == Owner::Empty {
+                new_territory += 1;
+            }
+
+            // Check all neighbors
+            let mut empty_count = 0;
+            let mut enemy_count = 0;
+            
+            for &(dyy, dxx) in DIRS {
+                let ny_i = ay as isize + dyy;
+                let nx_i = ax as isize + dxx;
+
+                if ny_i < 0 || nx_i < 0 {
+                    continue;
+                }
+
+                let ny = ny_i as usize;
+                let nx = nx_i as usize;
+
+                if ny >= rows || nx >= cols {
+                    continue;
+                }
+
+                match board.cells[ny][nx] {
+                    Owner::Empty => {
+                        empty_count += 1;
+                    }
+                    Owner::Opponent => {
+                        enemy_count += 1;
+                    }
+                    _ => {}
+                }
+            }
+
+            // Reward being near enemy (for blocking)
+            enemy_adjacency += enemy_count;
+            
+            // Reward having empty neighbors (mobility)
+            future_liberties += empty_count;
+            
+            // Reward blocking enemy liberties
+            if board.cells[ay][ax] == Owner::Empty && enemy_count > 0 {
+                blocked_opponent += 1;
             }
         }
 
-        // 2) Approximate how much free space the enemy can still reach after this move.
-        let enemy_space = self.reachable_space_for_enemy(board, piece, top_y, left_x);
+        // Calculate distance to nearest enemy
+        let min_dist_sq = self.min_distance_to_enemy(piece, top_y, left_x, enemy_coords);
+        
+        // Aggressive closeness score - heavily reward being close to enemy
+        let closeness_bonus = if min_dist_sq > 0 {
+            10000 / (min_dist_sq as i64 + 1)
+        } else {
+            10000
+        };
 
-        // 3) Approximate how much free space WE can reach after this move.
-        let my_space = self.reachable_space_for_me(board, piece, top_y, left_x);
-
-        // Main idea:
-        //  - heavily penalize large enemy_space
-        //  - reward large my_space
-        //  - reward immediate new_cells
-        //
-        // You can tweak these weights, but this is a good starting point.
+        // Simple, aggressive scoring:
+        // 1. New territory is most important
+        // 2. Stay close to enemy to compete for space
+        // 3. Block opponent when possible  
+        // 4. Maintain mobility to avoid being trapped
         let score =
-            (enemy_space as i64) * 1000  // biggest priority: starve enemy
-            - (my_space as i64) * 400    // also keep our options open
-            - (new_cells as i64) * 40;   // immediate gain
+            new_territory * 1000              // Expand!
+            + closeness_bonus * 5             // Get close to enemy
+            + blocked_opponent * 300          // Block when adjacent
+            + enemy_adjacency * 50            // Reward being near enemy
+            + future_liberties * 100;         // Keep options open
 
         score
     }
 
-    /// Helper: get the "owner" of (y, x) as if the piece is already placed.
-    /// If (y, x) is covered by the piece, treat it as Owner::Me.
-    fn owner_with_piece(
+    /// Minimal squared distance from any newly placed piece cell
+    /// to any enemy coordinate (on the current board).
+    /// If there is no enemy, we return 0.
+    fn min_distance_to_enemy(
         &self,
-        board: &Board,
         piece: &Piece,
         top_y: usize,
         left_x: usize,
-        y: usize,
-        x: usize,
-    ) -> Owner {
+        enemy_coords: &[(usize, usize)],
+    ) -> u64 {
+        if enemy_coords.is_empty() {
+            return 0;
+        }
+
+        let mut best: u64 = u64::MAX;
+
         for &(dy, dx) in &piece.cells {
-            if top_y + dy == y && left_x + dx == x {
-                return Owner::Me;
-            }
-        }
-        board.cells[y][x]
-    }
+            let y = top_y + dy;
+            let x = left_x + dx;
 
-    /// BFS the board from all enemy cells and count distinct empty cells
-    /// they can still reach if our piece is placed.
-    fn reachable_space_for_enemy(
-        &self,
-        board: &Board,
-        piece: &Piece,
-        top_y: usize,
-        left_x: usize,
-    ) -> u64 {
-        let rows = board.rows;
-        let cols = board.cols;
-        let mut visited = vec![false; rows * cols];
-        let mut q: VecDeque<(usize, usize)> = VecDeque::new();
-
-        // Initialize queue with all enemy cells (after placing our piece).
-        for y in 0..rows {
-            for x in 0..cols {
-                let owner = self.owner_with_piece(board, piece, top_y, left_x, y, x);
-                if owner == Owner::Opponent {
-                    let idx = y * cols + x;
-                    if !visited[idx] {
-                        visited[idx] = true;
-                        q.push_back((y, x));
-                    }
+            for &(ey, ex) in enemy_coords {
+                let dy_i = ey as isize - y as isize;
+                let dx_i = ex as isize - x as isize;
+                let d = (dy_i * dy_i + dx_i * dx_i) as u64;
+                if d < best {
+                    best = d;
                 }
             }
         }
 
-        let mut reachable_empty: u64 = 0;
-
-        const DIRS: &[(isize, isize)] = &[(1, 0), (-1, 0), (0, 1), (0, -1)];
-
-        while let Some((y, x)) = q.pop_front() {
-            for &(dy, dx) in DIRS {
-                let ny_i = y as isize + dy;
-                let nx_i = x as isize + dx;
-
-                if ny_i < 0 || nx_i < 0 {
-                    continue;
-                }
-
-                let ny = ny_i as usize;
-                let nx = nx_i as usize;
-
-                if ny >= rows || nx >= cols {
-                    continue;
-                }
-
-                let idx = ny * cols + nx;
-                if visited[idx] {
-                    continue;
-                }
-
-                let owner = self.owner_with_piece(board, piece, top_y, left_x, ny, nx);
-
-                match owner {
-                    Owner::Opponent => {
-                        // Enemy territory: they can pass through.
-                        visited[idx] = true;
-                        q.push_back((ny, nx));
-                    }
-                    Owner::Empty => {
-                        // Empty cell they could potentially occupy.
-                        visited[idx] = true;
-                        reachable_empty += 1;
-                        q.push_back((ny, nx));
-                    }
-                    Owner::Me => {
-                        // Our territory (including the new piece) blocks their path.
-                    }
-                }
-            }
-        }
-
-        reachable_empty
-    }
-
-    /// BFS the board from all our cells and count distinct empty cells
-    /// WE can reach after the move.
-    fn reachable_space_for_me(
-        &self,
-        board: &Board,
-        piece: &Piece,
-        top_y: usize,
-        left_x: usize,
-    ) -> u64 {
-        let rows = board.rows;
-        let cols = board.cols;
-        let mut visited = vec![false; rows * cols];
-        let mut q: VecDeque<(usize, usize)> = VecDeque::new();
-
-        // Initialize queue with all our cells (after placing our piece).
-        for y in 0..rows {
-            for x in 0..cols {
-                let owner = self.owner_with_piece(board, piece, top_y, left_x, y, x);
-                if owner == Owner::Me {
-                    let idx = y * cols + x;
-                    if !visited[idx] {
-                        visited[idx] = true;
-                        q.push_back((y, x));
-                    }
-                }
-            }
-        }
-
-        let mut reachable_empty: u64 = 0;
-        const DIRS: &[(isize, isize)] = &[(1, 0), (-1, 0), (0, 1), (0, -1)];
-
-        while let Some((y, x)) = q.pop_front() {
-            for &(dy, dx) in DIRS {
-                let ny_i = y as isize + dy;
-                let nx_i = x as isize + dx;
-
-                if ny_i < 0 || nx_i < 0 {
-                    continue;
-                }
-
-                let ny = ny_i as usize;
-                let nx = nx_i as usize;
-
-                if ny >= rows || nx >= cols {
-                    continue;
-                }
-
-                let idx = ny * cols + nx;
-                if visited[idx] {
-                    continue;
-                }
-
-                let owner = self.owner_with_piece(board, piece, top_y, left_x, ny, nx);
-
-                match owner {
-                    Owner::Me => {
-                        // Our own territory: we can pass through.
-                        visited[idx] = true;
-                        q.push_back((ny, nx));
-                    }
-                    Owner::Empty => {
-                        // Empty cell we can reach/occupy in future.
-                        visited[idx] = true;
-                        reachable_empty += 1;
-                        q.push_back((ny, nx));
-                    }
-                    Owner::Opponent => {
-                        // Opponent territory blocks our path.
-                    }
-                }
-            }
-        }
-
-        reachable_empty
+        if best == u64::MAX { 0 } else { best }
     }
 }
