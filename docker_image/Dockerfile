@@ -1,11 +1,22 @@
-FROM rust:1.63-buster
+FROM rust:latest
 
-COPY ./maps			        /filler/maps
-COPY ./linux_robots		    /filler/linux_robots
-COPY ./m1_robots		    /filler/m1_robots
-COPY ./linux_game_engine	/filler/linux_game_engine
-COPY ./m1_game_engine	    /filler/m1_game_engine
+# Set working directory
+WORKDIR /filler
 
-WORKDIR /filler/
+# Copy game engine, robots, and maps
+COPY linux_game_engine /filler/linux_game_engine
+COPY linux_robots /filler/linux_robots
+COPY maps /filler/maps
 
-ENTRYPOINT /bin/bash
+# Make game engine executable
+RUN chmod +x /filler/linux_game_engine
+
+# Make robot executables
+RUN chmod +x /filler/linux_robots/*
+
+# The solution directory will be mounted as a volume at runtime
+# No need to copy it here
+
+# Default command
+CMD ["/bin/bash"]
+
